@@ -1,0 +1,180 @@
+# media2doc-local —— 本机构建版 compose
+#
+# 为什么不用官方 compose：官方那份（412 B）用预构建镜像、不 build，两个 service 里
+# 既没有桶也没有 ASR。我们要改后端代码 + 加 CUDA + 加本地桶，必须自己写。
+#
+# ════════════════════════════════════════════════════════════════════════════
+# ★ 全篇最烧脑的一点：S3 地址有两个「视角」，一个变量喂不饱
+# ════════════════════════════════════════════════════════════════════════════
+# presigned URL 的 host 是签发者用 STORAGE_ENDPOINT 烧进签名的。本项目里
+# S3 的访问方有三个，各自看到的地址不同：
+#
+#   ┌──────────┬───────────────────────┬──────────────────────────────┐
+#   │ 谁        │ 它在哪                 │ 它眼中的 S3                   │
+#   ├──────────┼───────────────────────┼──────────────────────────────┤
+#   │ 浏览器    │ 宿主机                 │ http://127.0.0.1:9000        │
+#   │ 后端      │ backend 容器           │ 用不到（只签发，不传输）        │
+#   │ ASR       │ asr 容器               │ http://rustfs:9000           │
+#   └──────────┴───────────────────────┴──────────────────────────────┘
+#
+# 由此定下两条设计：
+#
+# ① 后端签发的 presigned URL 用 **127.0.0.1:9000**（给浏览器用）。
+#    这是给「上传」用的 —— 浏览器直传（frontend/src/apis/http.ts:150
+#    的 xhr.open('PUT', url)）。所以 backend 的 STORAGE_ENDPOINT 填宿主机地址。
+#
+# ② ASR **不用**后端给的 presigned URL 去下载，而是自己用 rustfs:9000
+#    直接 get_object。理由见下。
+#
+# ⚠️ 为什么 ② 不能偷懒复用 ①：ASR 在容器里，而 presigned URL 里烧的是
+#    127.0.0.1 —— 在 ASR 容器内部，127.0.0.1 指向它**自己**，不是 RustFS。
+#    这是本方案最容易踩的坑。绕开它有两条路：
+#      (a) 给 asr 加 extra_hosts: host.docker.internal:host-gateway，
+#          再让后端签一个 host 为 host.docker.internal 的 URL —— 要签两次，丑；
+#      (b) 让 ASR 用自己配置的 endpoint 直接取对象 —— 干净，且 ASR 本来
+#          就要装 S3 客户端。**本 compose 采用 (b)。**
+# ════════════════════════════════════════════════════════════════════════════
+
+services:
+
+  # ── ① 本地对象存储 ────────────────────────────────────────────────────────
+  # 选 RustFS 而非 MinIO：Apache-2.0，真 S3（含 multipart）。
+  # 选 RustFS 而非 OpenList：后者是 rclone 移植的「假 S3」（官方 package 说明原文
+  # 是 "implements a fake s3 server"），仅承诺 list/get/put/del 四个操作，
+  # boto3 隐式用到的 multipart / HeadObject / checksum 都在承诺之外。
+  rustfs:
+    image: rustfs/rustfs:latest
+    container_name: m2d-rustfs
+    restart: unless-stopped
+    # 9000 必须映射到宿主机 —— 浏览器要直传它
+    # 9001 控制台只绑 127.0.0.1，不开到 LAN（本机没配 TLS）
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    environment:
+      # ⚠️ 默认凭据 rustfsadmin/rustfsadmin 是公开的，必须覆盖
+      RUSTFS_ACCESS_KEY: "${RUSTFS_ACCESS_KEY:?必须在 .env 中设置}"
+      RUSTFS_SECRET_KEY: "${RUSTFS_SECRET_KEY:?必须在 .env 中设置}"
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ADDRESS: ":9001"
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_OBS_LOGGER_LEVEL: "warn"
+    volumes:
+      - rustfs-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # ── ② AI-Media2Doc 后端 ───────────────────────────────────────────────────
+  # CPU 镜像就够（9 个依赖里没有 GPU 相关）。重量级的全在 ③。
+  backend:
+    build:
+      # ★ 指向「打完补丁的副本」，不是 _tmp 原始源码 —— 否则补丁白打。
+      context: "../backend"
+      dockerfile: Dockerfile
+    container_name: m2d-backend
+    restart: unless-stopped
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      # ── LLM（任何 OpenAI 兼容端点，本地 Ollama 也行）──
+      LLM_BASE_URL: "${LLM_BASE_URL:-https://ark.cn-beijing.volces.com/api/v3}"
+      MODEL_ID: "${MODEL_ID}"
+      LLM_API_KEY: "${LLM_API_KEY}"
+      # ── ★ 宿主机视角：这个地址会被烧进 presigned URL 交给浏览器 ──
+      STORAGE_ENDPOINT: "http://127.0.0.1:9000"
+      STORAGE_ACCESS_KEY: "${RUSTFS_ACCESS_KEY}"
+      STORAGE_SECRET_KEY: "${RUSTFS_SECRET_KEY}"
+      STORAGE_REGION: "${STORAGE_REGION:-cn-east-1}"
+      STORAGE_BUCKET: "${STORAGE_BUCKET:-media2doc}"
+      # ── 本地 ASR service（替代火山 AUC）──
+      ASR_BASE_URL: "http://asr:8000"
+      # ── 显式清空火山残留 ──
+      # env.py:8-12 的 fallback 是 TOS_* 优先于 STORAGE_*。若环境里残留
+      # TOS_ENDPOINT，它会「赢」—— 应用看起来配置正确，实际仍在连云端。
+      TOS_ENDPOINT: ""
+      TOS_BUCKET: ""
+      TOS_ACCESS_KEY: ""
+      TOS_SECRET_KEY: ""
+      WEB_ACCESS_PASSWORD: "${WEB_ACCESS_PASSWORD:-}"
+    # 注意：backend 不需要 extra_hosts。它只签发 URL，从不自己传输文件字节。
+
+  # ── ③ 本地 ASR（faster-whisper + CUDA）─────────────────────────────────────
+  # 单独 service 而非并进 backend：CUDA 基础镜像好几个 GB，
+  # 合并会让「改一行后端代码」也要重建整个 CUDA 层。
+  asr:
+    build:
+      # 相对路径以本文件所在目录（config\）为基准 ⇒ ../asr
+      context: "../asr"
+      dockerfile: Dockerfile
+    container_name: m2d-asr
+    restart: unless-stopped
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    ports:
+      # 仅宿主机调试；正常走后端经 compose 网络访问 asr:8000
+      - "127.0.0.1:8001:8000"
+    environment:
+      ASR_MODEL_DIR: "/models/faster-whisper-large-v3"
+      # 4060 Laptop 8188 MiB；large-v3 FP16 约需 3.1 GB，余量充足
+      ASR_DEVICE: "cuda"
+      ASR_COMPUTE_TYPE: "float16"
+      # ★ ASR 自己取对象用的地址（容器视角）——见文件头 ②
+      S3_ENDPOINT: "http://rustfs:9000"
+      S3_ACCESS_KEY: "${RUSTFS_ACCESS_KEY}"
+      S3_SECRET_KEY: "${RUSTFS_SECRET_KEY}"
+      S3_REGION: "${STORAGE_REGION:-cn-east-1}"
+      S3_BUCKET: "${STORAGE_BUCKET:-media2doc}"
+      # ── 桶内产物寿命（天）──────────────────────────────────────────────
+      # 按**对象寿命**逐个判定：只删 LastModified 早于「现在 - 寿命」的对象。
+      # 不是「到期清空整个桶」—— 桶里同时躺着多个视频的产物，
+      # 一刀切会把还没用过的也一起带走。
+      #   0  → 关闭清理（桶只增不减）。**故意**不解释成「立即过期」：
+      #        手滑填 0 就清空整个桶的代价，远大于「忘了开清理」。
+      #   调大 → 省空间，但重跑老视频要重新过一遍 GPU 转写。
+      RETENTION_DAYS: "${RETENTION_DAYS:-1}"
+      # 扫描间隔（秒）。寿命以「天」计，扫得勤不会更早删，
+      # 只让「刚过期」的对象更快被回收。
+      CLEANUP_INTERVAL_SECONDS: "${CLEANUP_INTERVAL_SECONDS:-3600}"
+      # 启动后首次清理的延迟（秒）。默认 5 分钟 —— 错开启动时的模型加载，
+      # 别在用户刚点「开始」时去抢 S3 和 CPU。
+      CLEANUP_INITIAL_DELAY_SECONDS: "${CLEANUP_INITIAL_DELAY_SECONDS:-300}"
+    volumes:
+      # ⚠️ 只读挂载本机现成模型，不复制、不重下（README §2.4 已三重验证）
+      - type: bind
+        source: "${WHISPER_MODEL_HOST:?必须指向 faster-whisper-large-v3 模型目录}"
+        target: /models/faster-whisper-large-v3
+        read_only: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # ── ④ 前端 ────────────────────────────────────────────────────────────────
+  # 零代码改动，仅纳入 compose 并指向本机后端
+  frontend:
+    build:
+      context: "../frontend"
+      dockerfile: Dockerfile
+    container_name: m2d-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      VITE_API_BASE_URL: "http://localhost:8080"
+    ports:
+      - "5173:5173"
+
+volumes:
+  rustfs-data:
+    name: m2d-rustfs-data

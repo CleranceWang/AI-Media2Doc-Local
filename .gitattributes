@@ -1,0 +1,21 @@
+# 统一换行：仓库里一律 LF，检出时按平台自动转换。
+# 为什么需要：Windows 默认 autocrlf 会把 .py/.md 的 LF 改成 CRLF，
+# 进仓库后整个文件都显示为「已修改」，diff 变成噪音。
+# 例外：.bat 必须保持 CRLF —— cmd.exe 按字节切行，LF 会让脚本断在半截。
+* text=auto eol=lf
+
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
+
+# 二进制：别做任何换行转换，也别尝试 diff
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.wasm  binary
+*.bin   binary
+*.woff  binary
+*.woff2 binary
+*.zip   binary

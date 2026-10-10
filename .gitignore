@@ -1,0 +1,36 @@
+.idea
+*.tar
+logs
+.venv
+__pycache__
+*.pyc
+*.pyo
+.DS_Store
+*.pyd
+*.egg-info
+*.egg
+*.whl
+*.db
+*.sqlite
+*.log
+*.pid
+*.pdb
+*.cover
+*.coverage
+.pytest_cache
+*.hypothesis
+variables.env
+
+# ===== AI-Media2Doc-Local 追加 =====
+# 真实凭据：绝不入库
+config/.env
+config/.env.bak
+# 本项目的产物目录
+build/
+out/
+# 补丁备份
+*.orig
+# RustFS 数据（若有人挂到仓内）
+data/
+.env.local
+.secrets/
